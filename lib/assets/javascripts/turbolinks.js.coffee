@@ -8,7 +8,7 @@ requestMethod  = document.cookie.match(/request_method=(\w+)/)?[1].toUpperCase()
 xhr            = null
 
 visit = (url) ->
-  if browserSupportsPushState
+  if browserSupportsPushState && browserIsntBuggy
     cacheCurrentPage()
     reflectNewUrl url
     fetchReplacement url
@@ -29,9 +29,9 @@ fetchReplacement = (url) ->
   xhr.setRequestHeader 'X-XHR-Referer', referer
 
   xhr.onload = =>
-    doc = createDocument xhr.responseText
-
-    if assetsChanged doc
+    triggerEvent 'page:receive'
+    
+    if invalidContent(xhr) or assetsChanged (doc = createDocument xhr.responseText)
       document.location.reload()
     else
       changePage extractTitleAndBody(doc)...
@@ -75,10 +75,12 @@ cacheCurrentPage = ->
 constrainPageCacheTo = (limit) ->
   for own key, value of pageCache
     pageCache[key] = null if key <= currentState.position - limit
+  return
 
-changePage = (title, body, runScripts) ->
+changePage = (title, body, csrfToken, runScripts) ->
   document.title = title
   document.documentElement.replaceChild body, document.body
+  CSRFToken.update csrfToken if csrfToken?
   removeNoscriptTags()
   executeScriptTags() if runScripts
   currentState = window.history.state
@@ -93,10 +95,12 @@ executeScriptTags = ->
     { parentNode, nextSibling } = script
     parentNode.removeChild script
     parentNode.insertBefore copy, nextSibling
+  return
 
 removeNoscriptTags = ->
   noscriptTags = Array::slice.call document.body.getElementsByTagName 'noscript'
   noscript.parentNode.removeChild noscript for noscript in noscriptTags
+  return
 
 reflectNewUrl = (url) ->
   if url isnt document.location.href
@@ -140,6 +144,9 @@ triggerEvent = (name) ->
   document.dispatchEvent event
 
 
+invalidContent = (xhr) ->
+  !xhr.getResponseHeader('Content-Type').match /^(?:text\/html|application\/xhtml\+xml|application\/xml)(?:;|$)/
+
 extractTrackAssets = (doc) ->
   (node.src || node.href) for node in doc.head.childNodes when node.getAttribute?('data-turbolinks-track')?
 
@@ -154,8 +161,18 @@ intersection = (a, b) ->
 
 extractTitleAndBody = (doc) ->
   title = doc.querySelector 'title'
-  [ title?.textContent, doc.body, 'runScripts' ]
+  [ title?.textContent, doc.body, CSRFToken.get(doc).token, 'runScripts' ]
 
+CSRFToken =
+  get: (doc = document) ->
+    node:   tag = doc.querySelector 'meta[name="csrf-token"]'
+    token:  tag?.getAttribute? 'content'
+    
+  update: (latest) ->
+    current = @get()
+    if current.token? and latest? and current.token isnt latest
+      current.node.setAttribute 'content', latest
+      
 browserCompatibleDocumentParser = ->
   createDocumentUsingParser = (html) ->
     (new DOMParser).parseFromString html, 'text/html'
@@ -172,11 +189,11 @@ browserCompatibleDocumentParser = ->
     doc.close()
     doc
 
-  # Use createDocumentUsingParser if DOMParser is defined and natively 
+  # Use createDocumentUsingParser if DOMParser is defined and natively
   # supports 'text/html' parsing (Firefox 12+, IE 10)
   #
   # Use createDocumentUsingDOM if createDocumentUsingParser throws an exception
-  # due to unsupported type 'text/html' (Firefox < 12, Opera)  
+  # due to unsupported type 'text/html' (Firefox < 12, Opera)
   #
   # Use createDocumentUsingWrite if:
   #  - DOMParser isn't defined
@@ -196,8 +213,8 @@ browserCompatibleDocumentParser = ->
 
 installClickHandlerLast = (event) ->
   unless event.defaultPrevented
-    document.removeEventListener 'click', handleClick
-    document.addEventListener 'click', handleClick
+    document.removeEventListener 'click', handleClick, false
+    document.addEventListener 'click', handleClick, false
 
 handleClick = (event) ->
   unless event.defaultPrevented
@@ -220,7 +237,8 @@ anchoredLink = (link) ->
     (link.href is location.href + '#')
 
 nonHtmlLink = (link) ->
-  link.href.match(/\.[a-z]+(\?.*)?$/g) and not link.href.match(/\.html?(\?.*)?$/g)
+  url = removeHash link
+  url.match(/\.[a-z]+(\?.*)?$/g) and not url.match(/\.html?(\?.*)?$/g)
 
 noTurbolink = (link) ->
   until ignore or link is document
@@ -242,6 +260,7 @@ initializeTurbolinks = ->
   document.addEventListener 'click', installClickHandlerLast, true
   window.addEventListener 'popstate', (event) ->
     fetchHistory event.state if event.state?.turbolinks
+  , false
 
 browserSupportsPushState =
   window.history and window.history.pushState and window.history.replaceState and window.history.state != undefined
